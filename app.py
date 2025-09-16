@@ -658,9 +658,13 @@ def send_email():
             "suggestion": "Please check your email credentials or try using an app password for Gmail"
         }), 500
     
-@app.route('/', methods=['GET'])
+@app.route('/', methods=['GET', 'OPTIONS'])
 def health():
-    return jsonify({"status": "Backend running!", "timestamp": datetime.utcnow().isoformat()}), 200
+    response = jsonify({"status": "Backend running!", "timestamp": datetime.utcnow().isoformat()})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+    return response, 200
 
 @app.route("/api/auth/register", methods=["POST"])
 def register():
