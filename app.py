@@ -27,29 +27,55 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 import backoff
-from datetime import timedelta
 import pymongo
 from bson import ObjectId
+import logging
+
+# Initialize logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 # Configure APIs
 aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
+if not aai.settings.api_key:
+    raise ValueError("Missing ASSEMBLYAI_API_KEY in .env file")
+
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
     raise ValueError("Missing GEMINI_API_KEY in .env file")
 genai.configure(api_key=gemini_api_key)
 
 # MongoDB Configuration
-mongo_uri = "mongodb+srv://mudasirhanif5438_db_user:Zv3Oab8J6UOC4DR5@cluster0.hhowvmt.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+mongo_uri = os.getenv("MONGO_URI")
 if not mongo_uri:
     raise ValueError("Missing MONGO_URI in .env file")
 client = pymongo.MongoClient(mongo_uri)
-db = client['talktotext_pro']  # Database name
+db = client['talktotext_pro']
 users_collection = db['users']
 meetings_collection = db['meetings']
 counters_collection = db['counters']
+
+# Flask Configuration
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins for all routes
+app.config['UPLOAD_FOLDER'] = "uploads"
+app.config['OUTPUT_FOLDER'] = "outputs"
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-jwt-key-change-in-prod')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=90)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB limit
+app.config['JWT_ALGORITHM'] = 'HS256'
+app.config['JWT_TOKEN_LOCATION'] = ['headers']
+app.config['JWT_HEADER_NAME'] = 'Authorization'
+app.config['JWT_HEADER_TYPE'] = 'Bearer'
+
+jwt = JWTManager(app)
+
+# Allowed file extensions (added .webm for voice recordings)
+allowed_extensions = {'.mp3', '.wav', '.mp4', '.avi', '.mov', '.m4a', '.flac', '.webm'}
 
 def get_next_sequence(name):
     ret = counters_collection.find_one_and_update(
@@ -60,20 +86,8 @@ def get_next_sequence(name):
     )
     return ret['seq']
 
-# Flask Configuration
-app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})  # Changed to allow all origins
-app.config['UPLOAD_FOLDER'] = "uploads"
-app.config['JWT_SECRET_KEY'] = 'your-super-secret-jwt-key-change-in-prod'
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)  # Token valid for 30 days
-app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=90)  # Refresh token valid for 90 days
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Increased to 100MB
-app.config['JWT_ALGORITHM'] = 'HS256'
-app.config['JWT_TOKEN_LOCATION'] = ['headers']
-app.config['JWT_HEADER_NAME'] = 'Authorization'
-app.config['JWT_HEADER_TYPE'] = 'Bearer'
-
-jwt = JWTManager(app)
+def allowed_file(filename):
+    return os.path.splitext(filename)[1].lower() in allowed_extensions
 
 def update_processing_step(meeting, step_name, status, error=None):
     try:
@@ -92,17 +106,15 @@ def update_processing_step(meeting, step_name, status, error=None):
     if status == "in_progress":
         meeting['current_step_progress'] = 0
     elif status == "success":
-        meeting['current_step_progress'] = 0  # Reset for next step
+        meeting['current_step_progress'] = 0
     meetings_collection.update_one({'id': meeting['id']}, {'$set': {
         'processing_steps': meeting['processing_steps'],
         'current_step_progress': meeting['current_step_progress']
     }})
-    print(f"[DEBUG] Updated step {step_name} to {status}")
+    logger.debug(f"Updated step {step_name} to {status}")
 
 def simulate_step_progress(meeting_id, step_name, duration_seconds=8):
-    """Simulate realistic progress for each processing step"""
-    print(f"[DEBUG] Starting progress simulation for {step_name}")
-    
+    logger.debug(f"Starting progress simulation for {step_name}")
     progress_points = [10, 20, 35, 50, 65, 75, 85, 95, 100]
     interval = duration_seconds / len(progress_points)
     
@@ -111,22 +123,17 @@ def simulate_step_progress(meeting_id, step_name, duration_seconds=8):
             meeting = meetings_collection.find_one({'id': meeting_id})
             if not meeting:
                 break
-            
             steps = json.loads(meeting.get('processing_steps') or '[]')
             current_step = next((s for s in steps if s["step"] == step_name), None)
-            
             if not current_step or current_step["status"] != "in_progress":
-                print(f"[DEBUG] Step {step_name} no longer in progress, stopping simulation")
+                logger.debug(f"Step {step_name} no longer in progress, stopping simulation")
                 break
-            
             meetings_collection.update_one({'id': meeting_id}, {'$set': {'current_step_progress': progress}})
-            print(f"[DEBUG] {step_name} progress: {progress}%")
-            
+            logger.debug(f"{step_name} progress: {progress}%")
             if progress < 100:
                 time.sleep(interval)
-                    
         except Exception as e:
-            print(f"[ERROR] Progress simulation error: {e}")
+            logger.error(f"Progress simulation error: {e}")
             break
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3, max_time=120)
@@ -138,13 +145,11 @@ def call_gemini_api(prompt, model="gemini-1.5-flash"):
     return response
 
 def extract_comprehensive_content(transcript_text):
-    """Extract comprehensive content for longer transcripts"""
     if not transcript_text:
         return [], [], []
     
     sentences = []
     raw_sentences = re.split(r'[.!?]+|\n\n+', transcript_text)
-    
     for sentence in raw_sentences:
         sentence = sentence.strip()
         if len(sentence) > 15:
@@ -162,13 +167,11 @@ def extract_comprehensive_content(transcript_text):
         sentence_lower = sentence.lower()
         filler_count = sum(len(re.findall(pattern, sentence_lower)) for pattern in filler_patterns)
         word_count = len(sentence.split())
-        
         if word_count > 3 and (filler_count / max(word_count, 1)) < 0.4:
             meaningful_sentences.append(sentence)
     
     words = re.findall(r'\b[a-zA-Z]{3,}\b', transcript_text.lower())
     word_freq = Counter(words)
-    
     stop_words = {
         'the', 'and', 'that', 'have', 'for', 'not', 'with', 'you', 'this', 'but', 'his', 'from', 
         'they', 'she', 'her', 'been', 'than', 'its', 'were', 'said', 'each', 'which', 'their',
@@ -199,12 +202,9 @@ def extract_comprehensive_content(transcript_text):
     return meaningful_sentences, topics, key_phrases
 
 def generate_comprehensive_summary(transcript_text, title, meaningful_sentences, topics, key_phrases):
-    """Generate comprehensive summary for longer transcripts"""
-    
     word_count = len(transcript_text.split())
     char_count = len(transcript_text)
-    
-    print(f"[DEBUG] Generating summary for {word_count} words ({char_count} characters)")
+    logger.debug(f"Generating summary for {word_count} words ({char_count} characters)")
     
     if word_count < 100:
         return f"Brief meeting '{title}' with limited discussion content. The session covered basic topics and concluded with minimal actionable items."
@@ -223,23 +223,15 @@ def generate_comprehensive_summary(transcript_text, title, meaningful_sentences,
     
     if word_count > 3000:
         summary_template = f"""The comprehensive meeting '{title}' involved extensive discussions spanning multiple topics and themes. {topic_context}{phrase_context}
-
 The session demonstrated thorough exploration of complex subjects with detailed participant engagement. Key discussion segments covered strategic planning, operational considerations, and collaborative decision-making processes. 
-
 Participants provided in-depth analysis of current situations, explored various solutions, and established clear pathways for implementation. The meeting maintained strong focus on actionable outcomes while addressing both immediate concerns and long-term objectives.
-
 The extended dialogue allowed for comprehensive coverage of all relevant topics, ensuring stakeholder alignment and establishing concrete next steps for continued progress."""
-    
     elif word_count > 1500:
         summary_template = f"""The detailed meeting '{title}' covered substantial ground across multiple discussion areas. {topic_context}{phrase_context}
-
 Participants engaged in meaningful dialogue addressing key operational and strategic considerations. The session provided comprehensive coverage of relevant topics while maintaining focus on practical outcomes and actionable decisions.
-
 Discussion included thorough analysis of current challenges, evaluation of potential solutions, and establishment of clear implementation strategies. The meeting concluded with well-defined next steps and stakeholder commitments."""
-    
     else:
         summary_template = f"""The meeting '{title}' addressed important business topics through focused discussion. {topic_context}{phrase_context}
-
 Participants contributed valuable insights leading to clear outcomes and actionable decisions. The session maintained good momentum while covering all essential agenda items effectively."""
     
     if context_sentences:
@@ -251,23 +243,18 @@ Participants contributed valuable insights leading to clear outcomes and actiona
     return summary_template
 
 def process_long_transcript_in_chunks(transcript_text, title, max_chunk_size=25000):
-    """Process very long transcripts in chunks to avoid token limits"""
-    
     if len(transcript_text) <= max_chunk_size:
         return None
     
-    print(f"[DEBUG] Processing long transcript in chunks: {len(transcript_text)} characters")
-    
+    logger.debug(f"Processing long transcript in chunks: {len(transcript_text)} characters")
     chunks = []
     words = transcript_text.split()
-    
     current_chunk = []
     current_size = 0
     
     for word in words:
         current_chunk.append(word)
         current_size += len(word) + 1
-        
         if current_size >= max_chunk_size:
             chunks.append(' '.join(current_chunk))
             current_chunk = []
@@ -276,30 +263,24 @@ def process_long_transcript_in_chunks(transcript_text, title, max_chunk_size=250
     if current_chunk:
         chunks.append(' '.join(current_chunk))
     
-    print(f"[DEBUG] Created {len(chunks)} chunks for processing")
-    
+    logger.debug(f"Created {len(chunks)} chunks for processing")
     all_summaries = []
     all_key_points = []
     all_action_items = []
     all_decisions = []
     
     for i, chunk in enumerate(chunks):
-        print(f"[DEBUG] Processing chunk {i+1}/{len(chunks)}")
-        
+        logger.debug(f"Processing chunk {i+1}/{len(chunks)}")
         chunk_prompt = f"""
 Analyze this section of a longer meeting transcript and extract key information in JSON format:
-
 MEETING: {title}
 SECTION {i+1} of {len(chunks)}:
-
 {chunk}
-
 Extract:
 1. "summary": 2-3 sentence summary of this section
 2. "key_points": ALL significant points discussed (no limit)
 3. "action_items": Any tasks or follow-ups mentioned
 4. "decisions": Any decisions made in this section
-
 Respond with valid JSON only:
 {{
   "summary": "section summary",
@@ -308,30 +289,23 @@ Respond with valid JSON only:
   "decisions": ["decisions"]
 }}
         """
-        
         try:
             response = call_gemini_api(chunk_prompt)
             chunk_result = json.loads(response.text.strip())
-            
             if chunk_result.get("summary"):
                 all_summaries.append(f"Section {i+1}: {chunk_result['summary']}")
-            
             if chunk_result.get("key_points"):
                 all_key_points.extend(chunk_result["key_points"])
-                
             if chunk_result.get("action_items"):
                 all_action_items.extend(chunk_result["action_items"])
-                
             if chunk_result.get("decisions"):
                 all_decisions.extend(chunk_result["decisions"])
-                
         except Exception as e:
-            print(f"[ERROR] Failed to process chunk {i+1}: {e}")
+            logger.error(f"Failed to process chunk {i+1}: {e}")
             all_summaries.append(f"Section {i+1}: Discussion continued with various topics addressed")
             all_key_points.append(f"Continued discussion from section {i+1}")
     
     combined_summary = f"This comprehensive meeting '{title}' covered extensive topics across multiple discussion segments. " + " ".join(all_summaries[:5])
-    
     return {
         "summary": combined_summary,
         "key_points": all_key_points,
@@ -340,16 +314,13 @@ Respond with valid JSON only:
     }
 
 def start_processing(meeting_id):
-    print(f"[DEBUG] Starting processing thread for meeting ID: {meeting_id}")
-    
+    logger.debug(f"Starting processing thread for meeting ID: {meeting_id}")
     meeting = meetings_collection.find_one({'id': meeting_id})
     if not meeting:
-        print(f"[ERROR] Meeting {meeting_id} not found")
+        logger.error(f"Meeting {meeting_id} not found")
         return
-
     try:
         meetings_collection.update_one({'id': meeting_id}, {'$set': {'status': 'processing'}})
-        
         initial_steps = [
             {"step": "transcription", "status": "pending", "timestamp": "", "error": None},
             {"step": "translation", "status": "pending", "timestamp": "", "error": None},
@@ -360,17 +331,14 @@ def start_processing(meeting_id):
             'processing_steps': json.dumps(initial_steps),
             'current_step_progress': 0
         }})
-        
-        meeting = meetings_collection.find_one({'id': meeting_id})  # Refresh
-        
+        meeting = meetings_collection.find_one({'id': meeting_id})
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], meeting['filename'])
         if not os.path.exists(filepath):
             raise Exception(f"File not found: {filepath}")
-
-        # Step 1: Transcription (keep your existing transcription code)
-        print("[DEBUG] Starting transcription...")
-        update_processing_step(meetings_collection.find_one({'id': meeting_id}), "transcription", "in_progress")
         
+        # Step 1: Transcription
+        logger.debug("Starting transcription...")
+        update_processing_step(meetings_collection.find_one({'id': meeting_id}), "transcription", "in_progress")
         progress_thread = threading.Thread(target=simulate_step_progress, args=(meeting_id, "transcription", 15))
         progress_thread.daemon = True
         progress_thread.start()
@@ -382,24 +350,19 @@ def start_processing(meeting_id):
                 language_detection=True
             )
         )
-        
         with open(filepath, "rb") as f:
             audio_bytes = f.read()
-        
         transcript = transcriber.transcribe(audio_bytes)
-        
         if transcript.status == aai.TranscriptStatus.error:
             raise Exception(f"Transcription failed: {transcript.error}")
-        
         raw_text = transcript.text
-        print(f"[DEBUG] Transcription completed: {len(raw_text)} characters, {len(raw_text.split())} words")
-        
+        logger.debug(f"Transcription completed: {len(raw_text)} characters, {len(raw_text.split())} words")
         progress_thread.join(timeout=18)
         update_processing_step(meetings_collection.find_one({'id': meeting_id}), "transcription", "success")
         time.sleep(1)
         
-        # Steps 2 & 3: Translation and Optimization (keep your existing code)
-        print("[DEBUG] Starting translation...")
+        # Step 2: Translation
+        logger.debug("Starting translation...")
         update_processing_step(meetings_collection.find_one({'id': meeting_id}), "translation", "in_progress")
         progress_thread = threading.Thread(target=simulate_step_progress, args=(meeting_id, "translation", 10))
         progress_thread.daemon = True
@@ -410,7 +373,8 @@ def start_processing(meeting_id):
         update_processing_step(meetings_collection.find_one({'id': meeting_id}), "translation", "success")
         time.sleep(1)
         
-        print("[DEBUG] Starting optimization...")
+        # Step 3: Optimization
+        logger.debug("Starting optimization...")
         update_processing_step(meetings_collection.find_one({'id': meeting_id}), "optimization", "in_progress")
         progress_thread = threading.Thread(target=simulate_step_progress, args=(meeting_id, "optimization", 8))
         progress_thread.daemon = True
@@ -422,29 +386,24 @@ def start_processing(meeting_id):
         update_processing_step(meetings_collection.find_one({'id': meeting_id}), "optimization", "success")
         time.sleep(1)
         
-        # Step 4: IMPROVED AI Generation
-        print("[DEBUG] Starting enhanced AI generation...")
+        # Step 4: AI Generation
+        logger.debug("Starting enhanced AI generation...")
         update_processing_step(meetings_collection.find_one({'id': meeting_id}), "ai_generation", "in_progress")
-        
         progress_thread = threading.Thread(target=simulate_step_progress, args=(meeting_id, "ai_generation", 20))
         progress_thread.daemon = True
         progress_thread.start()
         
-        # IMPROVED PROMPT FOR BETTER KEY POINTS
         improved_prompt = f"""
 You are an expert meeting analyst. Analyze this meeting transcript and extract key insights.
-
 MEETING: {meeting['title']}
 TRANSCRIPT ({len(optimized_text)} characters):
 {optimized_text}
-
 INSTRUCTIONS:
 1. Read the entire transcript carefully
 2. Identify the MOST IMPORTANT discussion points, decisions, and topics
 3. Extract key points that someone who missed the meeting would need to know
 4. Focus on actionable items, important decisions, and significant discussions
 5. Avoid filler words and repetitive content
-
 Return ONLY valid JSON with this exact structure:
 {{
   "summary": "Comprehensive 4-6 sentence summary covering the meeting's main purpose, key discussions, and outcomes",
@@ -468,53 +427,39 @@ Return ONLY valid JSON with this exact structure:
   ],
   "sentiment": "Overall meeting tone and participant engagement level"
 }}
-
 CRITICAL: Extract key_points from ACTUAL transcript content, not generic statements. Focus on what was actually discussed.
 """
-        
         processed_data = None
-        
-        # Handle long transcripts
         if len(optimized_text) > 30000:
-            print("[DEBUG] Processing long transcript in chunks")
+            logger.debug("Processing long transcript in chunks")
             processed_data = process_long_transcript_in_chunks(optimized_text, meeting['title'])
         else:
             try:
-                print("[DEBUG] Sending request to Gemini API...")
+                logger.debug("Sending request to Gemini API...")
                 response = call_gemini_api(improved_prompt, model="gemini-1.5-flash")
                 ai_response = response.text.strip()
-                
-                # Clean the response
                 if ai_response.startswith("```json"):
                     ai_response = ai_response[7:]
                 if ai_response.endswith("```"):
                     ai_response = ai_response[:-3]
                 ai_response = ai_response.strip()
-                
-                print(f"[DEBUG] AI Response received: {len(ai_response)} characters")
-                print(f"[DEBUG] AI Response preview: {ai_response[:200]}...")
-                
+                logger.debug(f"AI Response received: {len(ai_response)} characters")
+                logger.debug(f"AI Response preview: {ai_response[:200]}...")
                 processed_data = json.loads(ai_response)
-                print(f"[DEBUG] AI processing successful - {len(processed_data.get('key_points', []))} key points extracted")
-                
-                # Validate that we have real key points
+                logger.debug(f"AI processing successful - {len(processed_data.get('key_points', []))} key points extracted")
                 if not processed_data.get('key_points') or len(processed_data.get('key_points', [])) == 0:
-                    print("[WARNING] No key points extracted, trying alternative approach")
+                    logger.warning("No key points extracted, trying alternative approach")
                     processed_data = None
-                
             except json.JSONDecodeError as e:
-                print(f"[ERROR] JSON decode error: {e}")
-                print(f"[ERROR] Raw response: {ai_response}")
+                logger.error(f"JSON decode error: {e}")
+                logger.error(f"Raw response: {ai_response}")
                 processed_data = None
             except Exception as e:
-                print(f"[ERROR] AI processing failed: {e}")
+                logger.error(f"AI processing failed: {e}")
                 processed_data = None
         
-        # IMPROVED fallback with real content extraction
         if not processed_data:
-            print("[DEBUG] Using improved fallback key points extraction")
-            
-            # Extract sentences that contain important keywords
+            logger.debug("Using improved fallback key points extraction")
             important_keywords = [
                 'decision', 'decided', 'agree', 'approved', 'resolved',
                 'action', 'task', 'follow up', 'next step', 'deadline',
@@ -523,24 +468,17 @@ CRITICAL: Extract key_points from ACTUAL transcript content, not generic stateme
                 'update', 'status', 'progress', 'result', 'outcome',
                 'budget', 'cost', 'resource', 'timeline', 'schedule'
             ]
-            
             sentences = re.split(r'[.!?]+', optimized_text)
             important_sentences = []
-            
             for sentence in sentences:
                 sentence = sentence.strip()
-                if len(sentence) > 20:  # Minimum length
+                if len(sentence) > 20:
                     sentence_lower = sentence.lower()
                     if any(keyword in sentence_lower for keyword in important_keywords):
                         important_sentences.append(sentence)
-            
-            # Limit to most relevant sentences
             key_points_from_content = important_sentences[:15] if important_sentences else []
-            
-            # If still no good content, extract based on topics
             if not key_points_from_content and topics:
                 key_points_from_content = [f"Discussion about {topic}" for topic in topics[:10]]
-            
             processed_data = {
                 "summary": generate_comprehensive_summary(optimized_text, meeting['title'], meaningful_sentences, topics, key_phrases),
                 "key_points": key_points_from_content,
@@ -555,14 +493,11 @@ CRITICAL: Extract key_points from ACTUAL transcript content, not generic stateme
                 "sentiment": "Professional meeting with productive discussions"
             }
         
-        # Always add raw transcript data
         processed_data["raw"] = raw_text
         processed_data["translated"] = translated_text
-        
         progress_thread.join(timeout=25)
         update_processing_step(meetings_collection.find_one({'id': meeting_id}), "ai_generation", "success")
         
-        # Save to database
         meetings_collection.update_one({'id': meeting_id}, {'$set': {
             'transcription': json.dumps({
                 "raw": raw_text,
@@ -575,12 +510,10 @@ CRITICAL: Extract key_points from ACTUAL transcript content, not generic stateme
             'status': 'completed',
             'current_step_progress': 0
         }})
-        
-        print(f"[DEBUG] Processing completed successfully for meeting {meeting_id}")
-        print(f"[DEBUG] Final key points count: {len(processed_data.get('key_points', []))}")
-        
+        logger.debug(f"Processing completed successfully for meeting {meeting_id}")
+        logger.debug(f"Final key points count: {len(processed_data.get('key_points', []))}")
     except Exception as e:
-        print(f"[ERROR] Processing error for meeting {meeting_id}: {e}")
+        logger.error(f"Processing error for meeting {meeting_id}: {e}")
         try:
             meeting = meetings_collection.find_one({'id': meeting_id})
             steps = json.loads(meeting.get('processing_steps') or '[]')
@@ -592,72 +525,6 @@ CRITICAL: Extract key_points from ACTUAL transcript content, not generic stateme
             pass
         meetings_collection.update_one({'id': meeting_id}, {'$set': {'status': 'failed'}})
 
-@app.route("/api/send-email", methods=["POST"])
-@jwt_required()
-def send_email():
-    try:
-        user_id = get_jwt_identity()
-        user = users_collection.find_one({'id': user_id})
-        
-        meeting_id = request.form.get('meeting_id')
-        to_email = request.form.get('to_email')
-        from_email = request.form.get('from_email') or user['email']
-        subject = request.form.get('subject')
-        body = request.form.get('body')
-        
-        if 'pdf_file' not in request.files:
-            return jsonify({"error": "No PDF file provided"}), 400
-        
-        pdf_file = request.files['pdf_file']
-        if pdf_file.filename == '':
-            return jsonify({"error": "No PDF file selected"}), 400
-        
-        meeting = meetings_collection.find_one({'id': int(meeting_id), 'user_id': user_id})
-        if not meeting:
-            return jsonify({"error": "Meeting not found"}), 404
-        
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 587
-        smtp_username = os.getenv("SMTP_USERNAME") or user['email']
-        smtp_password = os.getenv("SMTP_PASSWORD")
-        
-        if not smtp_password:
-            user_smtp_password = request.form.get('smtp_password')
-            if not user_smtp_password:
-                return jsonify({"error": "SMTP password not provided"}), 400
-            smtp_password = user_smtp_password
-        
-        msg = MIMEMultipart()
-        msg['From'] = from_email
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        
-        msg.attach(MIMEText(body, 'plain'))
-        
-        with pdf_file.stream as pdf_stream:
-            pdf_content = pdf_stream.read()
-        
-        part = MIMEApplication(pdf_content, Name=pdf_file.filename)
-        part['Content-Disposition'] = f'attachment; filename="{pdf_file.filename}"'
-        msg.attach(part)
-        
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-        server.login(smtp_username, smtp_password)
-        text = msg.as_string()
-        server.sendmail(smtp_username, to_email, text)
-        server.quit()
-        
-        print(f"[SUCCESS] Email sent from {smtp_username} to {to_email}")
-        return jsonify({"message": "Email sent successfully"})
-        
-    except Exception as smtp_error:
-        print(f"[ERROR] SMTP Error: {smtp_error}")
-        return jsonify({
-            "error": f"Failed to send email: {str(smtp_error)}",
-            "suggestion": "Please check your email credentials or try using an app password for Gmail"
-        }), 500
-    
 @app.route('/', methods=['GET', 'OPTIONS'])
 def health():
     response = jsonify({"status": "Backend running!", "timestamp": datetime.utcnow().isoformat()})
@@ -671,8 +538,8 @@ def register():
     try:
         data = request.json
         if users_collection.find_one({'email': data['email']}):
+            logger.error(f"Email already exists: {data['email']}")
             return jsonify({"error": "Email already exists"}), 400
-        
         user = {
             'id': get_next_sequence('user_id'),
             'full_name': data['full_name'],
@@ -680,44 +547,42 @@ def register():
             'password_hash': generate_password_hash(data['password'])
         }
         users_collection.insert_one(user)
-        
-        # Create long-lasting token
         access_token = create_access_token(
             identity=user['id'],
             expires_delta=timedelta(days=30)
         )
-        
+        logger.debug(f"User registered: {user['email']}, ID: {user['id']}")
         return jsonify({
             "access_token": access_token,
             "user": {"id": user['id'], "full_name": user['full_name'], "email": user['email']},
-            "expires_in": 30 * 24 * 60 * 60  # 30 days in seconds
+            "expires_in": 30 * 24 * 60 * 60
         }), 201
     except Exception as e:
+        logger.error(f"Register error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# Update your login function
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     try:
         data = request.json
         user = users_collection.find_one({'email': data['email']})
         if user and check_password_hash(user['password_hash'], data['password']):
-            # Create long-lasting token
             access_token = create_access_token(
                 identity=user['id'],
                 expires_delta=timedelta(days=30)
             )
-            
+            logger.debug(f"Login successful for user: {user['email']}, ID: {user['id']}")
             return jsonify({
                 "access_token": access_token,
                 "user": {"id": user['id'], "full_name": user['full_name'], "email": user['email']},
-                "expires_in": 30 * 24 * 60 * 60  # 30 days in seconds
+                "expires_in": 30 * 24 * 60 * 60
             })
+        logger.error(f"Invalid credentials for email: {data['email']}")
         return jsonify({"error": "Invalid credentials"}), 401
     except Exception as e:
+        logger.error(f"Login error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# Add a new endpoint to refresh tokens
 @app.route("/api/auth/refresh", methods=["POST"])
 @jwt_required()
 def refresh():
@@ -725,23 +590,22 @@ def refresh():
         current_user_id = get_jwt_identity()
         user = users_collection.find_one({'id': current_user_id})
         if not user:
+            logger.error(f"User not found: {current_user_id}")
             return jsonify({"error": "User not found"}), 404
-        
-        # Create new long-lasting token
         new_token = create_access_token(
             identity=current_user_id,
             expires_delta=timedelta(days=30)
         )
-        
+        logger.debug(f"Token refreshed for user ID: {current_user_id}")
         return jsonify({
             "access_token": new_token,
             "user": {"id": user['id'], "full_name": user['full_name'], "email": user['email']},
-            "expires_in": 30 * 24 * 60 * 60  # 30 days in seconds
+            "expires_in": 30 * 24 * 60 * 60
         })
     except Exception as e:
+        logger.error(f"Refresh token error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# Add a token validation endpoint
 @app.route("/api/auth/validate", methods=["GET"])
 @jwt_required()
 def validate_token():
@@ -749,107 +613,56 @@ def validate_token():
         current_user_id = get_jwt_identity()
         user = users_collection.find_one({'id': current_user_id})
         if not user:
+            logger.error(f"User not found: {current_user_id}")
             return jsonify({"error": "User not found"}), 404
-        
+        logger.debug(f"Token validated for user ID: {current_user_id}")
         return jsonify({
             "valid": True,
             "user": {"id": user['id'], "full_name": user['full_name'], "email": user['email']}
         })
     except Exception as e:
+        logger.error(f"Token validation error: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    try:
-        data = request.json
-        user_message = data.get('message', '').strip()
-        
-        if not user_message:
-            return jsonify({"error": "No message provided"}), 400
-        
-        system_prompt = (
-            "You are the AI assistant for TalkToText Pro.\n\n"
-            "About TalkToText Pro:\n"
-            "- It is an AI-powered meeting notes rewriter.\n"
-            "- Converts speech from Zoom, Google Meet, and Teams into structured, actionable meeting notes.\n"
-            "- Features: transcription, translation, text cleaning, summarization, PDF/Word export.\n"
-            "- Goal: Help users make their meetings productive, clear, and easy to follow.\n\n"
-            "Your role:\n"
-            "- If the user asks about the website, always explain TalkToText Pro in a professional but friendly way.\n"
-            "- If the user provides transcripts, summarize them and highlight key points, action items, and decisions.\n"
-            "- Keep responses concise, clear, and helpful.\n"
-            "- Always be friendly, professional, and focus on helping users understand and use TalkToText Pro effectively.\n"
-        )
-        
-        try:
-            response = call_gemini_api(
-                f"{system_prompt}\n\nUser: {user_message}",
-                model="gemini-1.5-flash"
-            )
-            
-            ai_response = response.text.strip()
-            
-            return jsonify({
-                "response": ai_response,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-            
-        except Exception as ai_error:
-            print(f"[ERROR] AI Chat error: {ai_error}")
-            fallback_responses = {
-                "features": "TalkToText Pro offers powerful features including: Real-time transcription from Zoom, Google Meet, and Teams, Multi-language translation, AI-powered text cleaning, Smart summarization with key points and action items, Export to PDF and Word formats. What would you like to know more about?",
-                "about": "TalkToText Pro is an AI-powered meeting notes rewriter that helps you convert speech from popular meeting platforms into structured, actionable notes. We make your meetings more productive and easier to follow!",
-                "how": "Getting started is simple! 1. Upload your meeting recording, 2. Our AI transcribes and processes it, 3. Review the generated notes and summaries, 4. Export in PDF or Word format. Need help with any specific step?",
-                "support": "I'm here to help! You can ask me about TalkToText Pro features, how to use the platform, or share meeting transcripts for me to summarize. What specific question do you have?",
-                "default": "Thanks for your question! I'm here to help you with TalkToText Pro. You can ask me about our features, how to use the platform, pricing, or share meeting content for analysis. How can I assist you today?"
-            }
-            
-            lower_message = user_message.lower()
-            if any(word in lower_message for word in ['feature', 'what can', 'capability']):
-                fallback_response = fallback_responses["features"]
-            elif any(word in lower_message for word in ['about', 'talktotex', 'website', 'company']):
-                fallback_response = fallback_responses["about"]
-            elif any(word in lower_message for word in ['how', 'tutorial', 'guide', 'start']):
-                fallback_response = fallback_responses["how"]
-            elif any(word in lower_message for word in ['help', 'support', 'problem']):
-                fallback_response = fallback_responses["support"]
-            else:
-                fallback_response = fallback_responses["default"]
-            
-            return jsonify({
-                "response": fallback_response,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-        
-    except Exception as e:
-        print(f"[ERROR] Chat endpoint error: {e}")
-        return jsonify({"error": "Sorry, I'm having trouble right now. Please try again."}), 500
 
 @app.route("/api/upload", methods=["POST"])
 @jwt_required()
 def upload():
     try:
         user_id = get_jwt_identity()
-        print(f"[DEBUG] User ID: {user_id}")
-        print(f"[DEBUG] Request files: {request.files}")
-        print(f"[DEBUG] Request form: {request.form}")
+        logger.debug(f"[DEBUG] User ID: {user_id}")
+        logger.debug(f"[DEBUG] Request files: {request.files}")
+        logger.debug(f"[DEBUG] Request form: {request.form}")
+        
         if "file" not in request.files:
-            print("[ERROR] No file uploaded")
+            logger.error("[ERROR] No file uploaded")
             return jsonify({"error": "No file uploaded"}), 400
+        
         file = request.files["file"]
         if file.filename == "":
-            print("[ERROR] No selected file")
+            logger.error("[ERROR] No selected file")
             return jsonify({"error": "No selected file"}), 400
-        print(f"[DEBUG] File received: {file.filename}, Size: {file.content_length}")
+        
+        if not allowed_file(file.filename):
+            logger.error(f"[ERROR] Unsupported file format: {file.filename}")
+            return jsonify({"error": f"Unsupported file format. Allowed: {', '.join(allowed_extensions)}"}), 422
+        
+        # Validate file size
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+        if file_size > app.config['MAX_CONTENT_LENGTH']:
+            logger.error(f"[ERROR] File too large: {file_size} bytes")
+            return jsonify({"error": f"File size too large. Maximum: {app.config['MAX_CONTENT_LENGTH'] / (1024 * 1024)}MB"}), 422
+        
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
-        print(f"[DEBUG] File saved to: {filepath}")
+        logger.debug(f"[DEBUG] File saved to: {filepath}")
         
         meeting = {
             'id': get_next_sequence('meeting_id'),
             'user_id': user_id,
-            'title': request.form.get('title', filename),
+            'title': request.form.get('title', filename).strip(),
             'filename': filename,
             'upload_date': datetime.utcnow(),
             'status': 'uploaded',
@@ -861,12 +674,17 @@ def upload():
             'processing_steps': '[]',
             'current_step_progress': 0
         }
-        meetings_collection.insert_one(meeting)
         
-        return jsonify({"recording_id": meeting['id']})
+        if not meeting['title']:
+            logger.error("[ERROR] Title is empty")
+            return jsonify({"error": "Title cannot be empty"}), 422
+        
+        meetings_collection.insert_one(meeting)
+        logger.debug(f"[DEBUG] Meeting created: ID {meeting['id']}")
+        return jsonify({"recording_id": meeting['id']}), 200
     except Exception as e:
-        print(f"[ERROR] Upload error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"[ERROR] Upload error: {str(e)}")
+        return jsonify({"error": str(e)}), 422
 
 @app.route("/api/process/<int:meeting_id>", methods=["POST"])
 @jwt_required()
@@ -874,19 +692,19 @@ def process_meeting(meeting_id):
     try:
         user_id = get_jwt_identity()
         meeting = meetings_collection.find_one({'id': meeting_id, 'user_id': user_id})
-        
         if not meeting:
+            logger.error(f"Meeting not found: {meeting_id}")
             return jsonify({"error": "Meeting not found"}), 404
-        
         if meeting['status'] != 'uploaded':
+            logger.error(f"Meeting already {meeting['status']}: {meeting_id}")
             return jsonify({"error": f"Meeting already {meeting['status']}"}), 400
-        
         thread = threading.Thread(target=start_processing, args=(meeting_id,))
         thread.daemon = True
         thread.start()
-        
+        logger.debug(f"Processing started for meeting ID: {meeting_id}")
         return jsonify({"message": "Processing started", "recording_id": meeting_id}), 202
     except Exception as e:
+        logger.error(f"Process meeting error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/processing-status/<int:meeting_id>", methods=["GET"])
@@ -895,15 +713,13 @@ def processing_status(meeting_id):
     try:
         user_id = get_jwt_identity()
         meeting = meetings_collection.find_one({'id': meeting_id, 'user_id': user_id})
-        
         if not meeting:
+            logger.error(f"Meeting not found: {meeting_id}")
             return jsonify({"error": "Meeting not found"}), 404
-        
         try:
             steps = json.loads(meeting.get('processing_steps') or '[]')
         except:
             steps = []
-        
         if not steps:
             steps = [
                 {"step": "transcription", "status": "pending", "timestamp": "", "error": None},
@@ -911,7 +727,7 @@ def processing_status(meeting_id):
                 {"step": "optimization", "status": "pending", "timestamp": "", "error": None},
                 {"step": "ai_generation", "status": "pending", "timestamp": "", "error": None}
             ]
-        
+        logger.debug(f"Processing status for meeting ID: {meeting_id}")
         return jsonify({
             "recording_id": meeting['id'],
             "status": meeting['status'],
@@ -919,6 +735,7 @@ def processing_status(meeting_id):
             "current_step_progress": meeting.get('current_step_progress') or 0
         })
     except Exception as e:
+        logger.error(f"Processing status error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/meetings", methods=["GET"])
@@ -929,7 +746,7 @@ def get_meetings():
         limit = request.args.get('limit', 10000000, type=int)
         meetings_cursor = meetings_collection.find({'user_id': user_id}).sort('upload_date', pymongo.DESCENDING).limit(limit)
         meetings = list(meetings_cursor)
-        
+        logger.debug(f"Fetched {len(meetings)} meetings for user ID: {user_id}")
         return jsonify({
             "meetings": [
                 {
@@ -944,6 +761,7 @@ def get_meetings():
             ]
         })
     except Exception as e:
+        logger.error(f"Get meetings error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/meetings/<int:meeting_id>", methods=["DELETE"])
@@ -952,18 +770,17 @@ def delete_meeting(meeting_id):
     try:
         user_id = get_jwt_identity()
         meeting = meetings_collection.find_one({'id': meeting_id, 'user_id': user_id})
-        
         if not meeting:
+            logger.error(f"Meeting not found: {meeting_id}")
             return jsonify({"error": "Meeting not found"}), 404
-        
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], meeting['filename'])
         if os.path.exists(filepath):
             os.remove(filepath)
-        
         meetings_collection.delete_one({'id': meeting_id})
-        
+        logger.debug(f"Meeting deleted: ID {meeting_id}")
         return jsonify({"message": "Meeting deleted successfully"}), 200
     except Exception as e:
+        logger.error(f"Delete meeting error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/meetings/<int:meeting_id>", methods=["GET"])
@@ -972,10 +789,10 @@ def get_meeting(meeting_id):
     try:
         user_id = get_jwt_identity()
         meeting = meetings_collection.find_one({'id': meeting_id, 'user_id': user_id})
-        
         if not meeting:
+            logger.error(f"Meeting not found: {meeting_id}")
             return jsonify({"error": "Meeting not found"}), 404
-        
+        logger.debug(f"Fetched meeting: ID {meeting_id}")
         return jsonify({
             "meeting": {
                 "id": meeting['id'],
@@ -988,7 +805,74 @@ def get_meeting(meeting_id):
             }
         })
     except Exception as e:
+        logger.error(f"Get meeting error: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/send-email", methods=["POST"])
+@jwt_required()
+def send_email():
+    try:
+        user_id = get_jwt_identity()
+        user = users_collection.find_one({'id': user_id})
+        meeting_id = request.form.get('meeting_id')
+        to_email = request.form.get('to_email')
+        from_email = request.form.get('from_email') or user['email']
+        subject = request.form.get('subject')
+        body = request.form.get('body')
+        
+        if 'pdf_file' not in request.files:
+            logger.error("No PDF file provided")
+            return jsonify({"error": "No PDF file provided"}), 400
+        
+        pdf_file = request.files['pdf_file']
+        if pdf_file.filename == '':
+            logger.error("No PDF file selected")
+            return jsonify({"error": "No PDF file selected"}), 400
+        
+        meeting = meetings_collection.find_one({'id': int(meeting_id), 'user_id': user_id})
+        if not meeting:
+            logger.error(f"Meeting not found: {meeting_id}")
+            return jsonify({"error": "Meeting not found"}), 404
+        
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        smtp_username = os.getenv("SMTP_USERNAME") or user['email']
+        smtp_password = os.getenv("SMTP_PASSWORD")
+        
+        if not smtp_password:
+            user_smtp_password = request.form.get('smtp_password')
+            if not user_smtp_password:
+                logger.error("SMTP password not provided")
+                return jsonify({"error": "SMTP password not provided"}), 400
+            smtp_password = user_smtp_password
+        
+        msg = MIMEMultipart()
+        msg['From'] = from_email
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        
+        with pdf_file.stream as pdf_stream:
+            pdf_content = pdf_stream.read()
+        part = MIMEApplication(pdf_content, Name=pdf_file.filename)
+        part['Content-Disposition'] = f'attachment; filename="{pdf_file.filename}"'
+        msg.attach(part)
+        
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        text = msg.as_string()
+        server.sendmail(smtp_username, to_email, text)
+        server.quit()
+        
+        logger.debug(f"Email sent from {smtp_username} to {to_email}")
+        return jsonify({"message": "Email sent successfully"})
+    except Exception as e:
+        logger.error(f"SMTP Error: {str(e)}")
+        return jsonify({
+            "error": f"Failed to send email: {str(e)}",
+            "suggestion": "Please check your email credentials or try using an app password for Gmail"
+        }), 500
 
 @app.route("/api/translate", methods=["POST"])
 @jwt_required()
@@ -997,8 +881,8 @@ def translate_text():
         data = request.json
         text = data.get('text', '').strip()
         target_language = data.get('target_language', 'es')
-        
         if not text:
+            logger.error("No text provided")
             return jsonify({"error": "No text provided"}), 400
         
         language_names = {
@@ -1026,40 +910,157 @@ def translate_text():
             "uz": "Uzbek", "vi": "Vietnamese", "cy": "Welsh", "xh": "Xhosa", "yi": "Yiddish",
             "yo": "Yoruba", "zu": "Zulu"
         }
-        
         target_lang_name = language_names.get(target_language, "Spanish")
-        
         try:
             prompt = f"""
 You are a professional translator. Translate the given text to {target_lang_name}. Respond only with the translated text, no additional formatting or explanations.
-
 Text to translate: {text}
 """
             response = call_gemini_api(prompt, model="gemini-1.5-flash")
             translated = response.text.strip() if response.text else ""
-            
             if not translated:
+                logger.error("Translation failed: Empty response from API")
                 return jsonify({"error": "Translation failed: Empty response from API"}), 500
-            
+            logger.debug(f"Translated text to {target_lang_name}")
             return jsonify({"translated_text": translated})
-            
         except Exception as e:
-            print(f"[ERROR] Translation API error: {str(e)}")
+            logger.error(f"Translation API error: {str(e)}")
             return jsonify({
                 "error": "Translation service unavailable",
                 "details": str(e),
                 "suggestion": "Please check your GEMINI_API_KEY or network connection and try again."
             }), 500
-        
     except Exception as e:
-        print(f"[ERROR] Translate endpoint error: {str(e)}")
+        logger.error(f"Translate endpoint error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    try:
+        data = request.json
+        user_message = data.get('message', '').strip()
+        if not user_message:
+            logger.error("No message provided")
+            return jsonify({"error": "No message provided"}), 400
+        system_prompt = (
+            "You are the AI assistant for TalkToText Pro.\n\n"
+            "About TalkToText Pro:\n"
+            "- It is an AI-powered meeting notes rewriter.\n"
+            "- Converts speech from Zoom, Google Meet, and Teams into structured, actionable meeting notes.\n"
+            "- Features: transcription, translation, text cleaning, summarization, PDF/Word export.\n"
+            "- Goal: Help users make their meetings productive, clear, and easy to follow.\n\n"
+            "Your role:\n"
+            "- If the user asks about the website, always explain TalkToText Pro in a professional but friendly way.\n"
+            "- If the user provides transcripts, summarize them and highlight key points, action items, and decisions.\n"
+            "- Keep responses concise, clear, and helpful.\n"
+            "- Always be friendly, professional, and focus on helping users understand and use TalkToText Pro effectively.\n"
+        )
+        try:
+            response = call_gemini_api(
+                f"{system_prompt}\n\nUser: {user_message}",
+                model="gemini-1.5-flash"
+            )
+            ai_response = response.text.strip()
+            logger.debug(f"Chat response generated: {ai_response[:200]}...")
+            return jsonify({
+                "response": ai_response,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        except Exception as ai_error:
+            logger.error(f"AI Chat error: {ai_error}")
+            fallback_responses = {
+                "features": "TalkToText Pro offers powerful features including: Real-time transcription from Zoom, Google Meet, and Teams, Multi-language translation, AI-powered text cleaning, Smart summarization with key points and action items, Export to PDF and Word formats. What would you like to know more about?",
+                "about": "TalkToText Pro is an AI-powered meeting notes rewriter that helps you convert speech from popular meeting platforms into structured, actionable notes. We make your meetings more productive and easier to follow!",
+                "how": "Getting started is simple! 1. Upload your meeting recording, 2. Our AI transcribes and processes it, 3. Review the generated notes and summaries, 4. Export in PDF or Word format. Need help with any specific step?",
+                "support": "I'm here to help! You can ask me about TalkToText Pro features, how to use the platform, or share meeting transcripts for me to summarize. What specific question do you have?",
+                "default": "Thanks for your question! I'm here to help you with TalkToText Pro. You can ask me about our features, how to use the platform, pricing, or share meeting content for analysis. How can I assist you today?"
+            }
+            lower_message = user_message.lower()
+            if any(word in lower_message for word in ['feature', 'what can', 'capability']):
+                fallback_response = fallback_responses["features"]
+            elif any(word in lower_message for word in ['about', 'talktotex', 'website', 'company']):
+                fallback_response = fallback_responses["about"]
+            elif any(word in lower_message for word in ['how', 'tutorial', 'guide', 'start']):
+                fallback_response = fallback_responses["how"]
+            elif any(word in lower_message for word in ['help', 'support', 'problem']):
+                fallback_response = fallback_responses["support"]
+            else:
+                fallback_response = fallback_responses["default"]
+            logger.debug(f"Using fallback response: {fallback_response[:200]}...")
+            return jsonify({
+                "response": fallback_response,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+    except Exception as e:
+        logger.error(f"Chat endpoint error: {str(e)}")
+        return jsonify({"error": "Sorry, I'm having trouble right now. Please try again."}), 500
+
+@app.route("/api/export/<int:id>/<string:format>", methods=["GET"])
+@jwt_required()
+def export(id, format):
+    try:
+        user_id = get_jwt_identity()
+        meeting = meetings_collection.find_one({'id': id, 'user_id': user_id})
+        if not meeting:
+            logger.error(f"Meeting not found: {id}")
+            return jsonify({"error": "Meeting not found"}), 404
+        os.makedirs("outputs", exist_ok=True)
+        if format == "word":
+            filepath = f"outputs/meeting_notes_{id}.docx"
+            doc = Document()
+            doc.add_heading(f"Meeting Notes: {meeting['title']}", 0)
+            doc.add_paragraph(f"File: {meeting['filename']}")
+            doc.add_paragraph(f"Date: {meeting['upload_date'].strftime('%Y-%m-%d %H:%M')}")
+            doc.add_paragraph("")
+            try:
+                notes = json.loads(meeting.get('notes') or '{}')
+                if notes.get("summary"):
+                    doc.add_heading("Executive Summary", level=1)
+                    doc.add_paragraph(notes["summary"])
+                if notes.get("key_points"):
+                    doc.add_heading("Key Discussion Points", level=1)
+                    key_points = notes["key_points"] if isinstance(notes["key_points"], list) else json.loads(notes["key_points"] or '[]')
+                    for point in key_points:
+                        doc.add_paragraph(point, style="List Bullet")
+                if notes.get("action_items"):
+                    doc.add_heading("Action Items", level=1)
+                    action_items = notes["action_items"] if isinstance(notes["action_items"], list) else json.loads(notes["action_items"] or '[]')
+                    for item in action_items:
+                        doc.add_paragraph(item, style="List Number")
+                if notes.get("decisions"):
+                    doc.add_heading("Decisions Made", level=1)
+                    decisions = notes["decisions"] if isinstance(notes["decisions"], list) else json.loads(notes["decisions"] or '[]')
+                    for decision in decisions:
+                        doc.add_paragraph(decision, style="List Bullet")
+                if notes.get("sentiment"):
+                    doc.add_heading("Overall Sentiment", level=1)
+                    doc.add_paragraph(notes["sentiment"])
+                transcription_data = json.loads(meeting.get('transcription') or '{}')
+                transcript_text = transcription_data.get('optimized') or transcription_data.get('translated') or transcription_data.get('raw')
+                if transcript_text:
+                    doc.add_heading("Full Transcript", level=1)
+                    doc.add_paragraph(transcript_text)
+            except Exception as e:
+                logger.error(f"Word export error: {str(e)}")
+                doc.add_paragraph(f"Error parsing notes: {str(e)}")
+            doc.save(filepath)
+            logger.debug(f"Word file generated: {filepath}")
+            return send_file(filepath, as_attachment=True, download_name=f"meeting_notes_{id}.docx")
+        elif format == "pdf":
+            filepath = f"outputs/meeting_notes_{id}.pdf"
+            create_enhanced_pdf(meeting, filepath)
+            logger.debug(f"PDF file generated: {filepath}")
+            return send_file(filepath, as_attachment=True, download_name=f"meeting_notes_{id}.pdf")
+        logger.error(f"Invalid format: {format}")
+        return jsonify({"error": "Invalid format"}), 400
+    except Exception as e:
+        logger.error(f"Export error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 def create_enhanced_pdf(meeting, filepath):
     doc = SimpleDocTemplate(filepath, pagesize=letter)
     styles = getSampleStyleSheet()
     story = []
-    
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Heading1'],
@@ -1067,7 +1068,6 @@ def create_enhanced_pdf(meeting, filepath):
         spaceAfter=30,
         textColor='navy'
     )
-    
     heading_style = ParagraphStyle(
         'CustomHeading',
         parent=styles['Heading2'],
@@ -1076,141 +1076,55 @@ def create_enhanced_pdf(meeting, filepath):
         spaceAfter=10,
         textColor='darkblue'
     )
-    
     story.append(Paragraph(f"Meeting Notes: {meeting['title']}", title_style))
     story.append(Spacer(1, 20))
-    
     story.append(Paragraph(f"<b>File:</b> {meeting['filename']}", styles['Normal']))
     story.append(Paragraph(f"<b>Date:</b> {meeting['upload_date'].strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
     story.append(Spacer(1, 20))
-    
     try:
         notes = json.loads(meeting.get('notes') or '{}')
-        
         if notes.get('summary'):
             story.append(Paragraph("Executive Summary", heading_style))
             story.append(Paragraph(notes['summary'], styles['Normal']))
             story.append(Spacer(1, 15))
-        
         if notes.get('key_points'):
             story.append(Paragraph("Key Discussion Points", heading_style))
             key_points = notes['key_points'] if isinstance(notes['key_points'], list) else json.loads(notes['key_points'] or '[]')
             for i, point in enumerate(key_points, 1):
                 story.append(Paragraph(f"{i}. {point}", styles['Normal']))
             story.append(Spacer(1, 15))
-        
         if notes.get('action_items'):
             story.append(Paragraph("Action Items", heading_style))
             action_items = notes['action_items'] if isinstance(notes['action_items'], list) else json.loads(notes['action_items'] or '[]')
             for i, item in enumerate(action_items, 1):
                 story.append(Paragraph(f"• {item}", styles['Normal']))
             story.append(Spacer(1, 15))
-        
         if notes.get('decisions'):
             story.append(Paragraph("Decisions Made", heading_style))
             decisions = notes['decisions'] if isinstance(notes['decisions'], list) else json.loads(notes['decisions'] or '[]')
             for decision in decisions:
                 story.append(Paragraph(f"• {decision}", styles['Normal']))
             story.append(Spacer(1, 15))
-        
         if notes.get('sentiment'):
             story.append(Paragraph("Overall Sentiment", heading_style))
             story.append(Paragraph(notes['sentiment'], styles['Normal']))
             story.append(Spacer(1, 15))
-        
         transcription_data = json.loads(meeting.get('transcription') or '{}')
         transcript_text = transcription_data.get('optimized') or transcription_data.get('translated') or transcription_data.get('raw')
-        
         if transcript_text:
             story.append(PageBreak())
             story.append(Paragraph("Full Transcript", heading_style))
             story.append(Spacer(1, 10))
-            
             max_chunk_size = 2000
             transcript_chunks = [transcript_text[i:i+max_chunk_size] for i in range(0, len(transcript_text), max_chunk_size)]
-            
             for chunk in transcript_chunks:
                 clean_chunk = chunk.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                 story.append(Paragraph(clean_chunk, styles['Normal']))
                 story.append(Spacer(1, 10))
-        
     except Exception as e:
+        logger.error(f"PDF generation error: {e}")
         story.append(Paragraph("Error: Could not parse meeting notes", styles['Normal']))
-        print(f"[ERROR] PDF generation error: {e}")
-    
     doc.build(story)
-
-@app.route("/api/export/<int:id>/<string:format>", methods=["GET"])
-@jwt_required()
-def export(id, format):
-    try:
-        user_id = get_jwt_identity()
-        meeting = meetings_collection.find_one({'id': id, 'user_id': user_id})
-        
-        if not meeting:
-            return jsonify({"error": "Meeting not found"}), 404
-        
-        os.makedirs("outputs", exist_ok=True)
-        
-        if format == "word":
-            filepath = f"outputs/meeting_notes_{id}.docx"
-            doc = Document()
-            doc.add_heading(f"Meeting Notes: {meeting['title']}", 0)
-            
-            doc.add_paragraph(f"File: {meeting['filename']}")
-            doc.add_paragraph(f"Date: {meeting['upload_date'].strftime('%Y-%m-%d %H:%M')}")
-            doc.add_paragraph("")
-            
-            try:
-                notes = json.loads(meeting.get('notes') or '{}')
-                
-                if notes.get("summary"):
-                    doc.add_heading("Executive Summary", level=1)
-                    doc.add_paragraph(notes["summary"])
-                
-                if notes.get("key_points"):
-                    doc.add_heading("Key Discussion Points", level=1)
-                    key_points = notes["key_points"] if isinstance(notes["key_points"], list) else json.loads(notes["key_points"] or '[]')
-                    for point in key_points:
-                        doc.add_paragraph(point, style="List Bullet")
-                
-                if notes.get("action_items"):
-                    doc.add_heading("Action Items", level=1)
-                    action_items = notes["action_items"] if isinstance(notes["action_items"], list) else json.loads(notes["action_items"] or '[]')
-                    for item in action_items:
-                        doc.add_paragraph(item, style="List Number")
-                
-                if notes.get("decisions"):
-                    doc.add_heading("Decisions Made", level=1)
-                    decisions = notes["decisions"] if isinstance(notes["decisions"], list) else json.loads(notes["decisions"] or '[]')
-                    for decision in decisions:
-                        doc.add_paragraph(decision, style="List Bullet")
-                
-                if notes.get("sentiment"):
-                    doc.add_heading("Overall Sentiment", level=1)
-                    doc.add_paragraph(notes["sentiment"])
-                
-                transcription_data = json.loads(meeting.get('transcription') or '{}')
-                transcript_text = transcription_data.get('optimized') or transcription_data.get('translated') or transcription_data.get('raw')
-                
-                if transcript_text:
-                    doc.add_heading("Full Transcript", level=1)
-                    doc.add_paragraph(transcript_text)
-                    
-            except Exception as e:
-                doc.add_paragraph(f"Error parsing notes: {str(e)}")
-            
-            doc.save(filepath)
-            return send_file(filepath, as_attachment=True, download_name=f"meeting_notes_{id}.docx")
-            
-        elif format == "pdf":
-            filepath = f"outputs/meeting_notes_{id}.pdf"
-            create_enhanced_pdf(meeting, filepath)
-            return send_file(filepath, as_attachment=True, download_name=f"meeting_notes_{id}.pdf")
-        
-        return jsonify({"error": "Invalid format"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/stats", methods=["GET"])
 @jwt_required()
@@ -1219,15 +1133,13 @@ def stats():
         user_id = get_jwt_identity()
         meetings_cursor = meetings_collection.find({'user_id': user_id})
         meetings = list(meetings_cursor)
-        
         total_uploads = len(meetings)
         total_words = sum(len(json.loads(m.get('notes') or '{}').get("summary", "").split()) for m in meetings)
-        
         today = datetime.utcnow().date()
         last_7_days = [(today - timedelta(days=i)).strftime("%a") for i in range(6, -1, -1)]
         uploads_by_day = Counter(m['upload_date'].date().strftime("%a") for m in meetings)
         uploads_data = [uploads_by_day.get(day, 0) for day in last_7_days]
-        
+        logger.debug(f"Stats fetched for user ID: {user_id}")
         return jsonify({
             "total_meetings": total_uploads,
             "completed_meetings": len([m for m in meetings if m['status'] == "completed"]),
@@ -1236,22 +1148,21 @@ def stats():
             "uploads": uploads_data
         })
     except Exception as e:
+        logger.error(f"Stats error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
-    
-    print("🚀 Starting Flask backend server...")
-    print("📁 Upload folder:", app.config['UPLOAD_FOLDER'])
-    print("🗄️ Database: MongoDB Atlas")
-    print("\n📧 Email Configuration:")
-    print(f"   SMTP_USERNAME: {'✅ Set' if os.getenv('SMTP_USERNAME') else '❌ Not set'}")
-    print(f"   SMTP_PASSWORD: {'✅ Set' if os.getenv('SMTP_PASSWORD') else '❌ Not set'}")
-    print("\n   To enable email functionality:")
-    print("   1. Create a .env file in your project root")
-    print("   2. Add: SMTP_USERNAME=your-email@gmail.com")
-    print("   3. Add: SMTP_PASSWORD=your-app-password")
-    print("   4. For Gmail, use App Passwords: https://support.google.com/accounts/answer/185833")
-    
+    logger.info("🚀 Starting Flask backend server...")
+    logger.info(f"📁 Upload folder: {app.config['UPLOAD_FOLDER']}")
+    logger.info("🗄️ Database: MongoDB Atlas")
+    logger.info("\n📧 Email Configuration:")
+    logger.info(f"   SMTP_USERNAME: {'✅ Set' if os.getenv('SMTP_USERNAME') else '❌ Not set'}")
+    logger.info(f"   SMTP_PASSWORD: {'✅ Set' if os.getenv('SMTP_PASSWORD') else '❌ Not set'}")
+    logger.info("\n   To enable email functionality:")
+    logger.info("   1. Create a .env file in your project root")
+    logger.info("   2. Add: SMTP_USERNAME=your-email@gmail.com")
+    logger.info("   3. Add: SMTP_PASSWORD=your-app-password")
+    logger.info("   4. For Gmail, use App Passwords: https://support.google.com/accounts/answer/185833")
     app.run(debug=True, host="0.0.0.0", port=5000)
