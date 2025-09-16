@@ -830,16 +830,21 @@ def chat():
 def upload():
     try:
         user_id = get_jwt_identity()
+        print(f"[DEBUG] User ID: {user_id}")
+        print(f"[DEBUG] Request files: {request.files}")
+        print(f"[DEBUG] Request form: {request.form}")
         if "file" not in request.files:
+            print("[ERROR] No file uploaded")
             return jsonify({"error": "No file uploaded"}), 400
-        
         file = request.files["file"]
         if file.filename == "":
+            print("[ERROR] No selected file")
             return jsonify({"error": "No selected file"}), 400
-        
+        print(f"[DEBUG] File received: {file.filename}, Size: {file.content_length}")
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
+        print(f"[DEBUG] File saved to: {filepath}")
         
         meeting = {
             'id': get_next_sequence('meeting_id'),
@@ -860,6 +865,7 @@ def upload():
         
         return jsonify({"recording_id": meeting['id']})
     except Exception as e:
+        print(f"[ERROR] Upload error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/process/<int:meeting_id>", methods=["POST"])
