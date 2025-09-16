@@ -62,7 +62,7 @@ def get_next_sequence(name):
 
 # Flask Configuration
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Changed to allow all origins
 app.config['UPLOAD_FOLDER'] = "uploads"
 app.config['JWT_SECRET_KEY'] = 'your-super-secret-jwt-key-change-in-prod'
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)  # Token valid for 30 days
@@ -183,7 +183,7 @@ def extract_comprehensive_content(transcript_text):
     }
     
     topics = [word for word, count in word_freq.most_common(50) 
-             if word not in stop_words and count > 2 and len(word) > 3]
+              if word not in stop_words and count > 2 and len(word) > 3]
     
     phrases = []
     words_list = transcript_text.lower().split()
@@ -623,73 +623,41 @@ def send_email():
         
         if not smtp_password:
             user_smtp_password = request.form.get('smtp_password')
-            if user_smtp_password:
-                smtp_password = user_smtp_password
-                smtp_username = from_email
+            if not user_smtp_password:
+                return jsonify({"error": "SMTP password not provided"}), 400
+            smtp_password = user_smtp_password
         
-        if not smtp_password:
-            print(f"[INFO] SMTP not configured. Email would be sent:")
-            print(f"[INFO] From: {from_email} To: {to_email}")
-            print(f"[INFO] Subject: {subject}")
-            print(f"[INFO] Body: {body}")
-            print(f"[INFO] PDF attachment: {pdf_file.filename}")
-            return jsonify({
-                "message": "Email prepared successfully. To enable sending, configure SMTP credentials.",
-                "demo_mode": True,
-                "email_details": {
-                    "from": from_email,
-                    "to": to_email,
-                    "subject": subject,
-                    "attachment": pdf_file.filename
-                }
-            })
+        msg = MIMEMultipart()
+        msg['From'] = from_email
+        msg['To'] = to_email
+        msg['Subject'] = subject
         
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = smtp_username
-            msg['To'] = to_email
-            msg['Subject'] = subject
-            msg['Reply-To'] = from_email
-            
-            email_body = f"""Meeting Notes from TalkToText Pro
-
-From: {user['full_name']} ({from_email})
-Meeting: {meeting['title']}
-Date: {meeting['upload_date'].strftime('%Y-%m-%d %H:%M')}
-
-{body}
-
----
-Sent via TalkToText Pro - AI-Powered Meeting Notes
-"""
-            
-            msg.attach(MIMEText(email_body, 'plain'))
-            
-            pdf_content = pdf_file.read()
-            part = MIMEApplication(pdf_content, _subtype='pdf')
-            part.add_header('Content-Disposition', f'attachment; filename={pdf_file.filename}')
-            msg.attach(part)
-            
-            server = smtplib.SMTP(smtp_server, smtp_port)
-            server.starttls()
-            server.login(smtp_username, smtp_password)
-            text = msg.as_string()
-            server.sendmail(smtp_username, to_email, text)
-            server.quit()
-            
-            print(f"[SUCCESS] Email sent from {smtp_username} to {to_email}")
-            return jsonify({"message": "Email sent successfully"})
-            
-        except Exception as smtp_error:
-            print(f"[ERROR] SMTP Error: {smtp_error}")
-            return jsonify({
-                "error": f"Failed to send email: {str(smtp_error)}",
-                "suggestion": "Please check your email credentials or try using an app password for Gmail"
-            }), 500
+        msg.attach(MIMEText(body, 'plain'))
         
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+        with pdf_file.stream as pdf_stream:
+            pdf_content = pdf_stream.read()
+        
+        part = MIMEApplication(pdf_content, Name=pdf_file.filename)
+        part['Content-Disposition'] = f'attachment; filename="{pdf_file.filename}"'
+        msg.attach(part)
+        
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        text = msg.as_string()
+        server.sendmail(smtp_username, to_email, text)
+        server.quit()
+        
+        print(f"[SUCCESS] Email sent from {smtp_username} to {to_email}")
+        return jsonify({"message": "Email sent successfully"})
+        
+    except Exception as smtp_error:
+        print(f"[ERROR] SMTP Error: {smtp_error}")
+        return jsonify({
+            "error": f"Failed to send email: {str(smtp_error)}",
+            "suggestion": "Please check your email credentials or try using an app password for Gmail"
+        }), 500
+    
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"status": "Backend running!", "timestamp": datetime.utcnow().isoformat()}), 200
@@ -863,7 +831,7 @@ def upload():
         
         file = request.files["file"]
         if file.filename == "":
-            return jupytext({"error": "No selected file"}), 400
+            return jsonify({"error": "No selected file"}), 400
         
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
