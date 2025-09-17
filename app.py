@@ -350,26 +350,45 @@ def process_long_transcript_in_chunks(transcript_text, title, max_chunk_size=250
         print(f"[DEBUG] Processing chunk {i+1}/{len(chunks)}")
         
         chunk_prompt = f"""
-Analyze this section of a longer meeting transcript and extract key information in JSON format:
+You are an expert transcript analyzer. Analyze this section of a longer meeting/video transcript and extract structured insights.
 
 MEETING: {title}
 SECTION {i+1} of {len(chunks)}:
 {chunk}
-Extract:
-1. "summary": 2-3 sentence summary of this section
-2. "key_points": ALL significant points discussed (no limit, be detailed and exact from transcript)
-3. "action_items": All tasks or follow-ups mentioned, with exact details, owners, deadlines if available
-4. "decisions": All decisions made in this section, with exact context
 
-Respond with valid JSON only:
+INSTRUCTIONS:
+1. Read this section carefully (do NOT skip details).
+2. Write a *detailed summary* proportional to the length of this section:
+   - Minimum 3–5 sentences for short sections.
+   - Longer sections require proportionally longer summaries.
+   - Capture purpose, discussion flow, and outcomes clearly.
+3. Extract *key_points*:
+   - List ALL factual and significant points discussed.
+   - Be exhaustive — capture context, data, and specifics.
+4. Extract *action_items*:
+   - Include every task, follow-up, or responsibility mentioned in this section.
+   - Note owners/deadlines if available.
+5. Extract *decisions*:
+   - List all decisions or agreements reached in this section.
+   - If no decisions, return an empty array [].
+6. Extract *sentiment*:
+   - Describe the tone (positive, negative, neutral, mixed).
+   - Mention engagement level of participants.
+
+Respond ONLY with valid JSON in this format:
 {{
-  "summary": "section summary",
-  "key_points": ["detailed key point 1", "detailed key point 2", ...],
-  "action_items": ["detailed action item 1", "detailed action item 2", ...],
-  "decisions": ["detailed decision 1", "detailed decision 2", ...]
+  "summary": "Proportional summary of this section",
+  "key_points": ["Detailed key point 1", "Detailed key point 2", "..."],
+  "action_items": ["Action item with owner/deadline if available", "..."],
+  "decisions": ["Decision 1 with context", "Decision 2 with context"],
+  "sentiment": "Overall tone + engagement"
 }}
-        """
-        
+
+CRITICAL RULES:
+- Respond with VALID JSON only.
+- Use only transcript content, no external assumptions.
+- Do not output text outside JSON.
+"""
         try:
             response = call_gemini_api(chunk_prompt)
             chunk_result = json.loads(response.text.strip())
@@ -489,7 +508,7 @@ def start_processing(meeting_id):
             progress_thread.start()
             
             improved_prompt = f"""
-You are an expert meeting analyst. Analyze the following transcript in detail and extract meaningful insights.
+You are an expert meeting/video analyst. Analyze the full transcript carefully and extract detailed structured insights.
 
 MEETING: {meeting.title}
 TRANSCRIPT ({len(optimized_text)} characters):
@@ -497,38 +516,43 @@ TRANSCRIPT ({len(optimized_text)} characters):
 
 INSTRUCTIONS:
 1. Read the entire transcript carefully (do NOT skip or compress too much).
-2. Write a *comprehensive summary* that captures the meeting's purpose, flow of discussion, key arguments, and outcomes. 
-   - The summary must be at least 5–8 sentences for a short meeting, and proportionally longer for longer transcripts (e.g., 10–15 sentences for 15+ minutes of audio).
-   - Include ALL major themes, not just one or two points.
-3. Extract *key points*: 
-   - These should be direct, factual insights from the transcript (not generic placeholders).
-   - Capture ALL important discussions, updates, concerns, and highlights in detail. Aim for as many as possible, at least 10-20 for longer transcripts.
-4. Extract *action items*:
-   - Write them as specific tasks with owners/context/deadlines if mentioned. Be exhaustive and extract ALL possible actions.
-   - Do not invent action items if not discussed, but infer if implied strongly.
+2. Write a *comprehensive summary* proportional to transcript length:
+   - For short transcripts (1–10 min): at least 5–8 sentences.
+   - For medium transcripts (10–30 min): 10–15+ sentences.
+   - For long transcripts (30–60 min): 20+ sentences.
+   - For very long transcripts (1–3 hours): multi-paragraph, fully covering purpose, flow, arguments, updates, examples, and outcomes.
+   - Do not miss or shorten any major theme.
+3. Extract *key_points*:
+   - These should be direct, factual insights from the transcript.
+   - Be exhaustive — capture every significant discussion, update, concern, and highlight in detail.
+   - Include specific names, data, examples, and references if mentioned.
+4. Extract *action_items*:
+   - List every task, follow-up, or responsibility discussed.
+   - Include owners/teams and deadlines if available.
+   - If implied strongly, include inferred actions with context.
 5. Extract *decisions*:
-   - List ALL actual decisions/resolutions reached, with exact context.
-   - Provide details if decisions were pending or partially agreed. Be exhaustive.
+   - List ALL actual decisions/resolutions reached with full context.
+   - Mention if decisions are pending, partial, or conditional.
 6. Analyze *sentiment*:
-   - Describe the tone (positive, negative, neutral, mixed).
-   - Mention participant engagement level (e.g., highly engaged, distracted, collaborative, tense).
+   - Describe overall tone (positive, negative, neutral, or mixed).
+   - Mention engagement levels (collaborative, tense, distracted, highly engaged, etc.).
 
 Return ONLY valid JSON with this exact structure:
 {{
-  "summary": "Write a detailed 3–5 sentence summary of this section, capturing purpose, flow, and outcomes. Use ONLY transcript content.",
+  "summary": "Comprehensive proportional summary of the full transcript",
   "key_points": [
-    "List ALL significant and factual points discussed in this section",
-    "Be exhaustive — do not skip important context or figures",
-    "Do not invent or generalize, only use transcript details"
+    "Factual key point 1",
+    "Factual key point 2",
+    "... (exhaustive list)"
   ],
   "action_items": [
-    "List every task, follow-up, or responsibility mentioned",
-    "Include owner names/teams and deadlines if available"
+    "Action item with owner/deadline if available",
+    "Another action item"
   ],
   "decisions": [
-    "List all concrete decisions made in this section with context",
-    "If no decisions, return an empty array []"
-  ]
+    "Decision with context",
+    "Pending or partial decision if discussed"
+  ],
   "sentiment": "Overall tone + engagement level"
 }}
 
@@ -537,6 +561,7 @@ CRITICAL RULES:
 - Use only transcript content, no external assumptions.
 - Do not output text outside JSON.
 """
+
 
             processed_data = None
             
