@@ -193,7 +193,7 @@ def simulate_step_progress(meeting_id, step_name, duration_seconds=8):
             break
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3, max_time=120)
-def call_gemini_api(prompt, model="gemini-1.5-flash"):
+def call_gemini_api(prompt, model="gemini-2.5-flash"):
     model_instance = genai.GenerativeModel(model)
     response = model_instance.generate_content(prompt)
     if not response or not hasattr(response, 'text') or not response.text:
@@ -354,10 +354,7 @@ Analyze this section of a longer meeting transcript and extract key information 
 
 MEETING: {title}
 SECTION {i+1} of {len(chunks)}:
-
 {chunk}
-
-
 Extract:
 1. "summary": 2-3 sentence summary of this section
 2. "key_points": ALL significant points discussed (no limit, be detailed and exact from transcript)
@@ -518,29 +515,27 @@ INSTRUCTIONS:
 
 Return ONLY valid JSON with this exact structure:
 {{
-  "summary": "Detailed multi-sentence summary (length proportional to transcript).",
+  "summary": "Write a detailed 3–5 sentence summary of this section, capturing purpose, flow, and outcomes. Use ONLY transcript content.",
   "key_points": [
-    "Factual key point 1 directly from transcript",
-    "Key point 2 with context",
-    "Additional important discussions...",
-    "Keep adding until ALL major points are covered"
+    "List ALL significant and factual points discussed in this section",
+    "Be exhaustive — do not skip important context or figures",
+    "Do not invent or generalize, only use transcript details"
   ],
   "action_items": [
-    "Task 1 with details",
-    "Task 2 with details"
+    "List every task, follow-up, or responsibility mentioned",
+    "Include owner names/teams and deadlines if available"
   ],
   "decisions": [
-    "Decision 1 with context",
-    "Decision 2 with details"
-  ],
+    "List all concrete decisions made in this section with context",
+    "If no decisions, return an empty array []"
+  ]
   "sentiment": "Overall tone + engagement level"
 }}
 
 CRITICAL RULES:
-- DO NOT shorten the summary unnecessarily; match the length of the transcript.
-- DO NOT output generic or placeholder text. Use ONLY transcript content.
-- If a category has no relevant items, return an empty array for that field.
-- Prioritize extracting as many key points, actions, and decisions as possible for comprehensiveness.
+- Respond with VALID JSON only.
+- Use only transcript content, no external assumptions.
+- Do not output text outside JSON.
 """
 
             processed_data = None
@@ -552,7 +547,7 @@ CRITICAL RULES:
             else:
                 try:
                     print("[DEBUG] Sending request to Gemini API...")
-                    response = call_gemini_api(improved_prompt, model="gemini-1.5-flash")
+                    response = call_gemini_api(improved_prompt, model="gemini-2.5-flash")
                     ai_response = response.text.strip()
                     
                     # Clean the response
@@ -1144,7 +1139,7 @@ You are a professional translator. Translate the given text to {target_lang_name
 
 Text to translate: {text}
 """
-            response = call_gemini_api(prompt, model="gemini-1.5-flash")
+            response = call_gemini_api(prompt, model="gemini-2.5-flash")
             translated = response.text.strip() if response.text else ""
             
             if not translated:
@@ -1387,7 +1382,7 @@ def chat():
         try:
             response = call_gemini_api(
                 f"{system_prompt}\n\nUser: {user_message}",
-                model="gemini-1.5-flash"
+                model="gemini-2.5-flash"
             )
             
             ai_response = response.text.strip()
