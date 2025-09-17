@@ -2,6 +2,7 @@ import os
 import mimetypes
 import json
 import re
+import socket
 import threading
 import time
 from datetime import datetime, timedelta
@@ -1434,60 +1435,82 @@ def send_email():
     try:
         user_id = get_jwt_identity()
         user = User.query.get(user_id)
-        
+        if not user:
+            print(f"[EMAIL ERROR] User {user_id} not found")
+            return jsonify({"error": "User not found"}), 404
+
+        # Extract form data
         meeting_id = request.form.get('meeting_id')
         to_email = request.form.get('to_email')
         from_email = request.form.get('from_email') or user.email
-        subject = request.form.get('subject')
-        body = request.form.get('body')
-        
+        subject = request.form.get('subject', f"Meeting Notes: {meeting_id}")
+        body = request.form.get('body', "Please find the meeting notes attached.")
+
+        # Validate required fields
+        if not meeting_id or not to_email:
+            print(f"[EMAIL ERROR] Missing required fields: meeting_id={meeting_id}, to_email={to_email}")
+            return jsonify({"error": "Meeting ID and recipient email are required"}), 400
+
+        # Validate email format
+        email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_regex, to_email):
+            print(f"[EMAIL ERROR] Invalid recipient email: {to_email}")
+            return jsonify({"error": "Invalid recipient email address"}), 400
+        if not re.match(email_regex, from_email):
+            print(f"[EMAIL ERROR] Invalid sender email: {from_email}")
+            return jsonify({"error": "Invalid sender email address"}), 400
+
+        # Validate PDF file
         if 'pdf_file' not in request.files:
+            print("[EMAIL ERROR] No PDF file provided")
             return jsonify({"error": "No PDF file provided"}), 400
-        
+
         pdf_file = request.files['pdf_file']
         if pdf_file.filename == '':
+            print("[EMAIL ERROR] No PDF file selected")
             return jsonify({"error": "No PDF file selected"}), 400
-        
+
+        # Verify meeting exists
         meeting = Meeting.query.filter_by(id=meeting_id, user_id=user_id).first()
         if not meeting:
+            print(f"[EMAIL ERROR] Meeting {meeting_id} not found for user {user_id}")
             return jsonify({"error": "Meeting not found"}), 404
-        
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 587
-        smtp_username = os.getenv("SMTP_USERNAME") or user.email
+
+        # SMTP configuration
+        smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+        smtp_port = int(os.getenv("SMTP_PORT", 587))
+        smtp_username = os.getenv("SMTP_USERNAME") or from_email
         smtp_password = os.getenv("SMTP_PASSWORD")
-        
-        if not smtp_password:
-            user_smtp_password = request.form.get('smtp_password')
-            if user_smtp_password:
-                smtp_password = user_smtp_password
-                smtp_username = from_email
-        
-        if not smtp_password:
-            print(f"[EMAIL INFO] SMTP not configured. Email would be sent:")
-            print(f"[EMAIL INFO] From: {from_email} To: {to_email}")
-            print(f"[EMAIL INFO] Subject: {subject}")
-            print(f"[EMAIL INFO] Body: {body}")
-            print(f"[EMAIL INFO] PDF attachment: {pdf_file.filename}")
+
+        # Check for SMTP credentials
+        if not smtp_username or not smtp_password:
+            print("[EMAIL ERROR] SMTP credentials not configured")
             return jsonify({
-                "message": "Email prepared successfully. To enable email, configure SMTP credentials in .env or provide smtp_password in request.",
-                "demo_mode": True,
-                "email_details": {
-                    "from": from_email,
-                    "to": to_email,
-                    "subject": subject,
-                    "attachment": pdf_file.filename
-                }
-            })
-        
+                "error": "SMTP credentials not configured",
+                "details": "Please set SMTP_USERNAME and SMTP_PASSWORD in your .env file or provide smtp_password in the request.",
+                "suggestion": "For Gmail, generate an App Password: https://support.google.com/accounts/answer/185833"
+            }), 500
+
+        # Validate PDF file integrity
         try:
-            msg = MIMEMultipart()
-            msg['From'] = from_email
-            msg['To'] = to_email
-            msg['Subject'] = subject
-            msg['Reply-To'] = from_email
-            
-            email_body = f"""Meeting Notes from TalkToText Pro
+            pdf_content = pdf_file.read()
+            if len(pdf_content) == 0:
+                print("[EMAIL ERROR] Empty PDF file")
+                return jsonify({"error": "PDF file is empty"}), 400
+            # Reset file pointer to start for further reading if needed
+            pdf_file.seek(0)
+        except Exception as e:
+            print(f"[EMAIL ERROR] Failed to read PDF file: {e}")
+            return jsonify({"error": f"Failed to read PDF file: {str(e)}"}), 400
+
+        # Create email
+        msg = MIMEMultipart()
+        msg['From'] = from_email
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg['Reply-To'] = from_email
+
+        email_body = f"""Meeting Notes from TalkToText Pro
 
 From: {user.full_name} ({from_email})
 Meeting: {meeting.title}
@@ -1498,47 +1521,75 @@ Date: {meeting.upload_date.strftime('%Y-%m-%d %H:%M')}
 ---
 Sent via TalkToText Pro - AI-Powered Meeting Notes
 """
-            
-            msg.attach(MIMEText(email_body, 'plain'))
-            
-            pdf_content = pdf_file.read()
-            part = MIMEApplication(pdf_content, _subtype='pdf')
-            part.add_header('Content-Disposition', f'attachment; filename={pdf_file.filename}')
-            msg.attach(part)
-            
-            server = smtplib.SMTP(smtp_server, smtp_port)
+        msg.attach(MIMEText(email_body, 'plain'))
+
+        # Attach PDF
+        part = MIMEApplication(pdf_content, _subtype='pdf')
+        part.add_header('Content-Disposition', f'attachment; filename={pdf_file.filename}')
+        msg.attach(part)
+
+        # Send email with timeout
+        try:
+            print(f"[EMAIL INFO] Attempting to connect to {smtp_server}:{smtp_port}")
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)  # 30-second timeout
             server.starttls()
+            print(f"[EMAIL INFO] Logging in with username: {smtp_username}")
             server.login(smtp_username, smtp_password)
-            text = msg.as_string()
-            server.sendmail(from_email, to_email, text)
+            print(f"[EMAIL INFO] Sending email from {from_email} to {to_email}")
+            server.sendmail(from_email, to_email, msg.as_string())
             server.quit()
-            
             print(f"[EMAIL SUCCESS] Email sent from {from_email} to {to_email}")
             return jsonify({"message": "Email sent successfully"})
-            
+
         except smtplib.SMTPAuthenticationError as auth_err:
             print(f"[EMAIL ERROR] Authentication failed: {auth_err}")
             return jsonify({
                 "error": "SMTP Authentication failed",
-                "details": "Check your username/password. For Gmail, use App Password: https://support.google.com/accounts/answer/185833",
+                "details": "Check your username/password. For Gmail, use an App Password: https://support.google.com/accounts/answer/185833",
                 "code": auth_err.smtp_code
-            }), 500
+            }), 401
+
         except smtplib.SMTPConnectError as conn_err:
             print(f"[EMAIL ERROR] Connection failed: {conn_err}")
             return jsonify({
                 "error": "SMTP Connection failed",
-                "details": "Check server/port or network. Using smtp.gmail.com:587"
+                "details": f"Could not connect to {smtp_server}:{smtp_port}. Check server/port or network settings."
             }), 500
+
+        except smtplib.SMTPServerDisconnected as disc_err:
+            print(f"[EMAIL ERROR] Server disconnected: {disc_err}")
+            return jsonify({
+                "error": "SMTP Server disconnected",
+                "details": "The server closed the connection unexpectedly. Check SMTP server settings or network stability."
+            }), 500
+
+        except socket.gaierror as gai_err:
+            print(f"[EMAIL ERROR] DNS resolution failed: {gai_err}")
+            return jsonify({
+                "error": "DNS resolution failed",
+                "details": f"Could not resolve {smtp_server}. Check server address or network connectivity."
+            }), 500
+
+        except socket.timeout as timeout_err:
+            print(f"[EMAIL ERROR] Connection timeout: {timeout_err}")
+            return jsonify({
+                "error": "SMTP Connection timeout",
+                "details": "The request to the SMTP server timed out after 30 seconds. Check network connectivity or server availability."
+            }), 500
+
         except Exception as smtp_error:
-            print(f"[EMAIL ERROR] SMTP Error: {smtp_error}")
+            print(f"[EMAIL ERROR] Unexpected SMTP error: {smtp_error}")
             return jsonify({
                 "error": f"Failed to send email: {str(smtp_error)}",
-                "suggestion": "Verify SMTP credentials, enable less secure apps if needed, or use app password for Gmail."
+                "suggestion": "Verify SMTP credentials, server/port, and network settings. For Gmail, use an App Password."
             }), 500
-        
+
     except Exception as e:
-        print(f"[EMAIL ERROR] Send email error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"[EMAIL ERROR] General error in send_email: {e}")
+        return jsonify({
+            "error": f"Internal server error: {str(e)}",
+            "suggestion": "Check server logs for details or contact support."
+        }), 500
 
 if __name__ == "__main__":
     # Create necessary directories
